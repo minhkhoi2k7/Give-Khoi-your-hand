@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hạt Giáng sinh điều khiển bằng tay</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05060a; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  #cam { position: fixed; right: 10px; bottom: 10px; width: 160px; border-radius: 10px; opacity: .55; transform: scaleX(-1); z-index: 3; }
+  #ui { position: fixed; top: 10px; left: 10px; z-index: 3; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button { background: #1d2333; color: #fff; border: 1px solid #556; padding: 9px 14px; border-radius: 8px; font-size: 14px; cursor: pointer; }
+  #status { background: rgba(0,0,0,.55); padding: 8px 12px; border-radius: 8px; font-size: 14px; }
+  #pick { position: fixed; top: 58px; left: 10px; z-index: 3; display: flex; gap: 6px; }
+  #pick button { padding: 6px 11px; }
+  #help { position: fixed; left: 10px; bottom: 10px; z-index: 3; font-size: 13px; line-height: 1.6; background: rgba(0,0,0,.5); padding: 8px 12px; border-radius: 8px; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="cam" playsinline muted></video>
+<div id="ui"><button id="start">Bật camera</button><span id="status">Nhấn "Bật camera" để bắt đầu</span></div>
+<div id="pick"></div>
+<div id="help">
+  ✊ Nắm tay: dải sáng &nbsp;|&nbsp; ☝️ 1 ngón: người tuyết &nbsp;|&nbsp; ✌️ 2: cây thông<br>
+  3 ngón: hộp quà &nbsp;|&nbsp; 4 ngón: "Khôi đây" &nbsp;|&nbsp; 🖐 5 ngón: "Xin chào, tạm biệt"<br>
+  Di chuyển tay để kéo hình · Gần/xa camera để to/nhỏ
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const video = document.getElementById("cam");
+const statusEl = document.getElementById("status");
+let W, H;
+function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+addEventListener("resize", resize); resize();
+
+// ---------- Tạo các hình đích từ emoji ----------
+const N = 7000;
+function sampleShape(draw, cw, ch) {
+  const o = document.createElement("canvas"); o.width = cw; o.height = ch;
+  const x = o.getContext("2d");
+  x.textAlign = "center"; x.textBaseline = "middle";
+  draw(x, cw, ch);
+  const d = x.getImageData(0, 0, cw, ch).data;
+  const pts = [];
+  for (let py = 0; py < ch; py += 2)
+    for (let px = 0; px < cw; px += 2) {
+      const i = (py * cw + px) * 4;
+      if (d[i + 3] > 120) pts.push({ x: px - cw / 2, y: py - ch / 2, c: `rgb(${d[i]},${d[i+1]},${d[i+2]})` });
+    }
+  // chọn đúng N điểm
+  const out = [];
+  for (let i = 0; i < N; i++) out.push(pts[(Math.random() * pts.length) | 0] || { x: 0, y: 0, c: "#fff" });
+  return { pts: out, cw, ch };
+}
+const emoji = (e, size) => (x, cw, ch) => { x.font = `${size}px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif`; x.fillText(e, cw / 2, ch / 2 + size * 0.06); };
+
+const FONT = '"Segoe UI","Helvetica Neue",Arial,"Noto Sans",sans-serif';
+function textShape(lines, size) {
+  return (x, cw, ch) => {
+    const g = x.createLinearGradient(0, 0, cw, 0);
+    g.addColorStop(0, "#ff6b8b"); g.addColorStop(0.5, "#ffd36b"); g.addColorStop(1, "#6bd6ff");
+    x.fillStyle = g; x.font = `bold ${size}px ${FONT}`;
+    const lh = size * 1.05, y0 = ch / 2 - (lines.length - 1) * lh / 2;
+    lines.forEach((t, i) => x.fillText(t, cw / 2, y0 + i * lh));
+  };
+}
+const shapes = {
+  1: sampleShape(emoji("⛄", 380), 460, 460),
+  2: sampleShape(emoji("🎄", 380), 460, 460),
+  3: sampleShape(emoji("🎁", 380), 460, 460),
+  4: sampleShape(textShape(["Khôi đây"], 190), 900, 300),
+  5: sampleShape(textShape(["Xin chào,", "tạm biệt"], 150), 900, 380),
+};
+let mode = 0; // 0 = dải sáng (nắm tay)
+
+// ---------- Hạt ----------
+const P = Array.from({ length: N }, () => ({ x: Math.random() * innerWidth, y: Math.random() * innerHeight, vx: 0, vy: 0, seed: Math.random() * 1000 }));
+const view = { x: innerWidth / 2, y: innerHeight / 2, s: 1 };
+const goal = { x: innerWidth / 2, y: innerHeight / 2, s: 1 };
+
+function frame(t) {
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "rgba(5,6,10,0.35)"; // để lại vệt mờ
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = "lighter";
+
+  view.x += (goal.x - view.x) * 0.15;
+  view.y += (goal.y - view.y) * 0.15;
+  view.s += (goal.s - view.s) * 0.1;
+  const time = t / 1000;
+  const sh = mode === 0 ? null : shapes[mode];
+  const target = sh ? sh.pts : null;
+  const base = sh ? Math.min(W * 0.85 / sh.cw, H * 0.6 / sh.ch) * view.s : 1;
+
+  for (let i = 0; i < N; i++) {
+    const p = P[i];
+    let tx, ty, color;
+    if (mode === 0) {
+      // dải sáng uốn lượn
+      const u = i / N;
+      tx = view.x + (u - 0.5) * 520 * view.s + Math.sin(u * 9 + time * 3) * 18;
+      ty = view.y + Math.sin(u * 5 - time * 2.2) * 80 * view.s + Math.cos(p.seed + time) * 8 * (1 - u);
+      color = `rgba(200,220,255,${0.25 + u * 0.6})`;
+    } else {
+      const q = target[i];
+      tx = view.x + q.x * base + Math.sin(time * 2 + p.seed) * 1.5;
+      ty = view.y + q.y * base + Math.cos(time * 2 + p.seed * 1.3) * 1.5;
+      color = q.c;
+    }
+    // lò xo kéo hạt về đích
+    p.vx = (p.vx + (tx - p.x) * 0.03) * 0.86;
+    p.vy = (p.vy + (ty - p.y) * 0.03) * 0.86;
+    p.x += p.vx; p.y += p.vy;
+    ctx.fillStyle = color;
+    ctx.fillRect(p.x, p.y, 2.2, 2.2);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+const names = ["✊", "⛄", "🎄", "🎁", "Khôi", "Chào"];
+const pick = document.getElementById("pick");
+names.forEach((n, i) => { const b = document.createElement("button"); b.textContent = n; b.onclick = () => (mode = i); pick.appendChild(b); });
+// Phím tắt để thử không cần camera
+addEventListener("keydown", e => { if (e.key >= "0" && e.key <= "5") mode = +e.key; });
+
+// ---------- Nhận diện tay ----------
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+function countFingers(lm) {
+  let n = 0;
+  // 4 ngón dài: đầu ngón xa cổ tay hơn khớp giữa
+  for (const [tip, pip] of [[8, 6], [12, 10], [16, 14], [20, 18]])
+    if (dist(lm[tip], lm[0]) > dist(lm[pip], lm[0]) * 1.1) n++;
+  // ngón cái: đầu ngón xa gốc ngón út hơn khớp IP
+  if (dist(lm[4], lm[17]) > dist(lm[3], lm[17]) * 1.05) n++;
+  return n;
+}
+
+let landmarker, lastT = -1, stable = { v: 0, c: 0 };
+document.getElementById("start").addEventListener("click", async () => {
+  try {
+    statusEl.textContent = "Đang tải mô hình...";
+    const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const make = delegate => HandLandmarker.createFromOptions(fs, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate },
+      runningMode: "VIDEO", numHands: 1
+    });
+    try { landmarker = await make("GPU"); } catch (e) { landmarker = await make("CPU"); }
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: "user" } });
+    await video.play();
+    statusEl.textContent = "Đưa tay vào khung hình ✋";
+    detect();
+  } catch (e) { statusEl.textContent = "Lỗi: " + e.message; }
+});
+
+function detect() {
+  if (video.currentTime !== lastT) {
+    lastT = video.currentTime;
+    const r = landmarker.detectForVideo(video, performance.now());
+    if (r.landmarks && r.landmarks.length) {
+      const lm = r.landmarks[0];
+      const n = countFingers(lm);
+      // chỉ đổi hình khi cử chỉ ổn định vài khung để tránh nhấp nháy
+      if (n === stable.v) stable.c++; else stable = { v: n, c: 1 };
+      if (stable.c === 4) mode = n;
+      statusEl.textContent = `Số ngón: ${n}`;
+      // vị trí lòng bàn tay (lật gương) và kích thước
+      const cx = (lm[0].x + lm[5].x + lm[17].x) / 3, cy = (lm[0].y + lm[5].y + lm[17].y) / 3;
+      goal.x = (1 - cx) * W; goal.y = cy * H;
+      const palm = Math.hypot(lm[0].x - lm[9].x, lm[0].y - lm[9].y);
+      goal.s = Math.min(2, Math.max(0.6, palm / 0.18));
+    }
+  }
+  requestAnimationFrame(detect);
+}
+</script>
+</body>
+</html>
